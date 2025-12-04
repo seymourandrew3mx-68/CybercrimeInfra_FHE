@@ -1,0 +1,187 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import { FHE, euint32, ebool } from "@fhevm/solidity/lib/FHE.sol";
+import { SepoliaConfig } from "@fhevm/solidity/config/ZamaConfig.sol";
+
+contract CybercrimeInfra_FHE is SepoliaConfig {
+    struct EncryptedIntel {
+        uint256 intelId;
+        address agency;
+        euint32 encryptedIpAddress;
+        euint32 encryptedDomainHash;
+        euint32 encryptedFirstSeen;
+        euint32 encryptedLastSeen;
+        euint32 encryptedThreatLevel;
+        uint256 timestamp;
+    }
+
+    struct AnalysisResult {
+        string infrastructureType;
+        string threatAssessment;
+        string[] linkedNodes;
+        bool isRevealed;
+    }
+
+    uint256 public intelCount;
+    uint256 public analysisCount;
+    mapping(uint256 => EncryptedIntel) public intelligenceReports;
+    mapping(uint256 => AnalysisResult) public analysisResults;
+    mapping(uint256 => uint256) private requestToAnalysisId;
+
+    event IntelSubmitted(uint256 indexed intelId, address indexed agency);
+    event AnalysisRequested(uint256 indexed analysisId);
+    event AnalysisCompleted(uint256 indexed analysisId);
+
+    modifier onlyAgency(uint256 intelId) {
+        require(msg.sender == intelligenceReports[intelId].agency, "Not authorized");
+        _;
+    }
+
+    function submitEncryptedIntel(
+        euint32 ipAddress,
+        euint32 domainHash,
+        euint32 firstSeen,
+        euint32 lastSeen,
+        euint32 threatLevel
+    ) public {
+        intelCount += 1;
+        uint256 newId = intelCount;
+
+        intelligenceReports[newId] = EncryptedIntel({
+            intelId: newId,
+            agency: msg.sender,
+            encryptedIpAddress: ipAddress,
+            encryptedDomainHash: domainHash,
+            encryptedFirstSeen: firstSeen,
+            encryptedLastSeen: lastSeen,
+            encryptedThreatLevel: threatLevel,
+            timestamp: block.timestamp
+        });
+
+        emit IntelSubmitted(newId, msg.sender);
+    }
+
+    function requestJointAnalysis(uint256[] memory intelIds) public {
+        require(intelIds.length > 0, "No intelligence provided");
+        
+        analysisCount += 1;
+        uint256 newAnalysisId = analysisCount;
+
+        bytes32[] memory ciphertexts = new bytes32[](intelIds.length * 5);
+        
+        for (uint i = 0; i < intelIds.length; i++) {
+            EncryptedIntel storage intel = intelligenceReports[intelIds[i]];
+            ciphertexts[i*5] = FHE.toBytes32(intel.encryptedIpAddress);
+            ciphertexts[i*5+1] = FHE.toBytes32(intel.encryptedDomainHash);
+            ciphertexts[i*5+2] = FHE.toBytes32(intel.encryptedFirstSeen);
+            ciphertexts[i*5+3] = FHE.toBytes32(intel.encryptedLastSeen);
+            ciphertexts[i*5+4] = FHE.toBytes32(intel.encryptedThreatLevel);
+        }
+
+        uint256 reqId = FHE.requestDecryption(ciphertexts, this.analyzeInfrastructure.selector);
+        requestToAnalysisId[reqId] = newAnalysisId;
+
+        analysisResults[newAnalysisId] = AnalysisResult({
+            infrastructureType: "",
+            threatAssessment: "",
+            linkedNodes: new string[](0),
+            isRevealed: false
+        });
+
+        emit AnalysisRequested(newAnalysisId);
+    }
+
+    function analyzeInfrastructure(
+        uint256 requestId,
+        bytes memory cleartexts,
+        bytes memory proof
+    ) public {
+        uint256 analysisId = requestToAnalysisId[requestId];
+        require(analysisId != 0, "Invalid request");
+
+        AnalysisResult storage result = analysisResults[analysisId];
+        require(!result.isRevealed, "Already analyzed");
+
+        FHE.checkSignatures(requestId, cleartexts, proof);
+
+        (string[] memory ips,
+         string[] memory domains,
+         uint32[] memory firstSeen,
+         uint32[] memory lastSeen,
+         uint32[] memory threatLevels) = abi.decode(cleartexts, (string[], string[], uint32[], uint32[], uint32[]));
+        
+        (result.infrastructureType,
+         result.threatAssessment,
+         result.linkedNodes) = _determineInfrastructureType(ips, domains, firstSeen, lastSeen, threatLevels);
+        
+        result.isRevealed = true;
+
+        emit AnalysisCompleted(analysisId);
+    }
+
+    function _determineInfrastructureType(
+        string[] memory ips,
+        string[] memory domains,
+        uint32[] memory firstSeen,
+        uint32[] memory lastSeen,
+        uint32[] memory threatLevels
+    ) private pure returns (
+        string memory,
+        string memory,
+        string[] memory
+    ) {
+        string memory infraType;
+        string memory threatAssessment;
+        string[] memory connections = new string[](ips.length);
+        
+        // Simplified analysis logic
+        uint32 totalThreat = 0;
+        for (uint i = 0; i < threatLevels.length; i++) {
+            totalThreat += threatLevels[i];
+        }
+        
+        if (totalThreat > threatLevels.length * 80) {
+            infraType = "C2 Infrastructure";
+            threatAssessment = "Critical Threat";
+        } else if (totalThreat > threatLevels.length * 50) {
+            infraType = "Phishing Network";
+            threatAssessment = "High Threat";
+        } else {
+            infraType = "Malware Distribution";
+            threatAssessment = "Medium Threat";
+        }
+        
+        for (uint i = 0; i < ips.length; i++) {
+            connections[i] = string(abi.encodePacked(ips[i], ":", domains[i]));
+        }
+        
+        return (infraType, threatAssessment, connections);
+    }
+
+    function getAnalysisResult(uint256 analysisId) public view returns (
+        string memory infraType,
+        string memory assessment,
+        string[] memory connections,
+        bool isRevealed
+    ) {
+        AnalysisResult storage r = analysisResults[analysisId];
+        return (r.infrastructureType, r.threatAssessment, r.linkedNodes, r.isRevealed);
+    }
+
+    function calculateEncryptedThreatScore(
+        euint32[] memory threatLevels
+    ) public pure returns (euint32) {
+        require(threatLevels.length > 0, "Empty array");
+        
+        euint32 total = threatLevels[0];
+        for (uint i = 1; i < threatLevels.length; i++) {
+            total = FHE.add(total, threatLevels[i]);
+        }
+        return FHE.div(total, FHE.asEuint32(uint32(threatLevels.length)));
+    }
+
+    function getIntelTimestamp(uint256 intelId) public view returns (uint256) {
+        return intelligenceReports[intelId].timestamp;
+    }
+}
